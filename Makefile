@@ -1,7 +1,7 @@
 CC ?= cc
 CFLAGS ?= -Os
 CPPFLAGS += -pedantic -Wall -Wextra
-LDFLAGS += -lxcb -lxcb-image
+LDFLAGS += -lxcb -lxcb-image -lxcb-shm
 
 PREFIX ?= /usr/local
 DESTDIR ?= /

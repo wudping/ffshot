@@ -4,6 +4,8 @@
 // Usage: ffshot | <farbfeld sink>
 // Made by vifino. ISC (C) vifino 2018
 
+#define CONFIG_LIBXCB_SHM 1
+
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -15,6 +17,12 @@
 #include <err.h>
 #include <sys/time.h> //for "struct timeval"
 #include <time.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#if CONFIG_LIBXCB_SHM
+#include <sys/shm.h>
+#include <xcb/shm.h>
+#endif
 
 // I know, I know, not standardized.
 // But painless fallback.
@@ -33,6 +41,7 @@
 #endif
 
 #define RGB8888 0
+#define FRAME_NUM 3000
 
 static inline void bwrite(const unsigned char* buffer, size_t bytes) {
 	if (!fwrite(buffer, bytes, 1, stdout)) {
@@ -54,6 +63,216 @@ static xcb_get_geometry_reply_t* gr;
 static xcb_get_image_cookie_t ic;
 static xcb_get_image_reply_t* ir;
 
+#define AV_INPUT_BUFFER_PADDING_SIZE 64
+
+typedef struct {
+    char *data;
+    long size;
+} image_dpwu_t;
+
+typedef struct XCBGrabContext {
+    uint8_t *buffer;
+
+    xcb_connection_t *conn;
+    xcb_screen_t *screen;
+    xcb_window_t window;
+#if CONFIG_LIBXCB_SHM
+    xcb_shm_seg_t segment;
+#endif
+    int64_t time_frame;
+
+    int x, y;
+    int width, height;
+    int frame_size;
+    int bpp;
+
+    int draw_mouse;
+    int follow_mouse;
+    int show_region;
+    int region_border;
+    int centered;
+
+    const char *video_size;
+    const char *framerate;
+
+    int has_shm;
+} XCBGrabContext;
+
+XCBGrabContext c_dt;
+
+
+
+#if (0)
+static int check_shm(xcb_connection_t *conn)
+{
+    xcb_shm_query_version_cookie_t cookie = xcb_shm_query_version(conn);
+    xcb_shm_query_version_reply_t *reply;
+
+    reply = xcb_shm_query_version_reply(conn, cookie, NULL);
+    if (reply) {
+        free(reply);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int allocate_shm(AVFormatContext *s)
+{
+    XCBGrabContext *c = s->priv_data;
+    int size = c->frame_size + AV_INPUT_BUFFER_PADDING_SIZE;
+    uint8_t *data;
+    int id;
+
+    if (c->buffer)
+        return 0;
+    id = shmget(IPC_PRIVATE, size, IPC_CREAT | 0777);
+    if (id == -1) {
+        char errbuf[1024];
+        int err = AVERROR(errno);
+        //av_strerror(err, errbuf, sizeof(errbuf));
+        //av_log(s, AV_LOG_ERROR, "Cannot get %d bytes of shared memory: %s.\n",
+               size, errbuf);
+        return err;
+    }
+    xcb_shm_attach(c->conn, c->segment, id, 0);
+    data = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, 0);
+    if ((intptr_t)data == -1 || !data)
+        return AVERROR(errno);
+    c->buffer = data;
+    return 0;
+}
+
+static int xcbgrab_frame_shm(AVFormatContext *s, AVPacket *pkt)
+{
+    XCBGrabContext *c = s->priv_data;
+    xcb_shm_get_image_cookie_t iq;
+    xcb_shm_get_image_reply_t *img;
+    xcb_drawable_t drawable = c->screen->root;
+    xcb_generic_error_t *e = NULL;
+    int ret;
+	printf("dpwu %s %s %d====\n", __FILE__, __FUNCTION__, __LINE__);
+
+    ret = allocate_shm(s);
+    if (ret < 0)
+        return ret;
+
+    iq = xcb_shm_get_image(c->conn, drawable,
+                           c->x, c->y, c->width, c->height, ~0,
+                           XCB_IMAGE_FORMAT_Z_PIXMAP, c->segment, 0);
+    img = xcb_shm_get_image_reply(c->conn, iq, &e);
+
+    xcb_flush(c->conn);
+
+    if (e) {
+        av_log(s, AV_LOG_ERROR,
+               "Cannot get the image data "
+               "event_error: response_type:%u error_code:%u "
+               "sequence:%u resource_id:%u minor_code:%u major_code:%u.\n",
+               e->response_type, e->error_code,
+               e->sequence, e->resource_id, e->minor_code, e->major_code);
+
+        return AVERROR(EACCES);
+    }
+
+    free(img);
+
+    pkt->data = c->buffer;
+    pkt->size = c->frame_size;
+
+    return 0;
+}
+#endif /* CONFIG_LIBXCB_SHM */
+
+#if CONFIG_LIBXCB_SHM
+static int check_shm(xcb_connection_t *conn)
+{
+    xcb_shm_query_version_cookie_t cookie;
+	cookie = xcb_shm_query_version(conn);
+    xcb_shm_query_version_reply_t *reply;
+
+    reply = xcb_shm_query_version_reply(conn, cookie, NULL);
+    if (reply) {
+        free(reply);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int allocate_shm(XCBGrabContext *c)
+{
+    //XCBGrabContext *c = s->priv_data;
+    int size = c->frame_size + AV_INPUT_BUFFER_PADDING_SIZE;
+    uint8_t *data;
+    int id;
+
+    if (c->buffer)
+        return 0;
+    id = shmget(IPC_PRIVATE, size, IPC_CREAT | 0777);
+    if (id == -1) {
+        char errbuf[1024];
+        //int err = AVERROR(errno);
+        //av_strerror(err, errbuf, sizeof(errbuf));
+        //av_log(s, AV_LOG_ERROR, "Cannot get %d bytes of shared memory: %s.\n",  size, errbuf);
+        //return err;
+        return -1;
+    }
+    xcb_shm_attach(c->conn, c->segment, id, 0);
+    data = shmat(id, NULL, 0);
+    shmctl(id, IPC_RMID, 0);
+    if ((intptr_t)data == -1 || !data)
+        return AVERROR(errno);
+    c->buffer = data;
+    return 0;
+}
+
+static int xcbgrab_frame_shm(XCBGrabContext *c, image_dpwu_t *pkt)
+{
+    //XCBGrabContext *c = s->priv_data;
+    xcb_shm_get_image_cookie_t iq;
+    xcb_shm_get_image_reply_t *img;
+    xcb_drawable_t drawable = c->screen->root;
+    xcb_generic_error_t *e = NULL;
+    int ret;
+	printf("dpwu %s %s %d====\n", __FILE__, __FUNCTION__, __LINE__);
+
+    ret = allocate_shm(c);
+    if (ret < 0)
+        return ret;
+
+    iq = xcb_shm_get_image(c->conn, drawable,
+                           c->x, c->y, c->width, c->height, ~0,
+                           XCB_IMAGE_FORMAT_Z_PIXMAP, c->segment, 0);
+    img = xcb_shm_get_image_reply(c->conn, iq, &e);
+
+    xcb_flush(c->conn);
+
+    if (e) {
+		/*
+        av_log(s, AV_LOG_ERROR,
+               "Cannot get the image data "
+               "event_error: response_type:%u error_code:%u "
+               "sequence:%u resource_id:%u minor_code:%u major_code:%u.\n",
+               e->response_type, e->error_code,
+               e->sequence, e->resource_id, e->minor_code, e->major_code);
+		return AVERROR(EACCES);
+		*/
+		return -1;
+    }
+
+    free(img);
+
+    pkt->data = c->buffer;
+    pkt->size = c->frame_size;
+
+    return 0;
+}
+#endif /* CONFIG_LIBXCB_SHM */
+
+
+
 int main(int argc, char* argv[]) {
 	if (!(argc == 1 || argc == 2)) { // one arg max
 		printf("Usage: %s [wid]\n", argv[0]);
@@ -64,10 +283,13 @@ int main(int argc, char* argv[]) {
 		win = (uint32_t) strtoumax(argv[1], (char* *) NULL, 0);
 	char fileName[512];
 	int i_dpwu = 0;
+	XCBGrabContext *c = &c_dt;
+	c->has_shm = 1;
 
 	con = xcb_connect(NULL, NULL);
 	if (xcb_connection_has_error(con))
 		errx(2, "Unable to connect to the X server");
+
 
 	scr = xcb_setup_roots_iterator(xcb_get_setup(con)).data;
 	if (!scr){
@@ -100,19 +322,31 @@ int main(int argc, char* argv[]) {
 		errx(2, "Failed to allocate buffer.");
 	}
 #if (1)
-		struct tm *t;
-		time_t tt;
-		time(&tt);
-		t = localtime(&tt);
-		printf("pthread_self() = %lu, %4d%02d%02d %02d:%02d:%02d xxxxxffff ====\n", pthread_self(), t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
+	struct tm *t;
+	time_t tt;
+	time(&tt);
+	t = localtime(&tt);
+	printf("pthread_self() = %lu, %4d%02d%02d %02d:%02d:%02d xxxxxffff ====\n", pthread_self(), t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
 #endif
 
+
+
+#if (0)	
+#if (CONFIG_LIBXCB_SHM)
+	if (c->has_shm = check_shm(c->conn)){
+		c->segment = xcb_generate_id(c->conn);
+	}
+			
+#endif
+#endif
+
+
 	while(1){
-		if(i_dpwu++ > 300){
+		if(i_dpwu++ > FRAME_NUM){
 			break;
 		}
 
-		//sleep(1);
+		usleep(100 * 1000);
 
 		// Get image from the X server. Yuck.
 		fprintf(stderr, "%08x: %ux%u to %ux%u\n", win, pos_x, pos_y, width, height);
@@ -156,16 +390,11 @@ int main(int argc, char* argv[]) {
 			}else{
 				dst_p = i * 3;
 			}
-			// BGRA? thanks Xorg.
-			r = data[p + 2] << 8;
-			g = data[p + 1] << 8;
-			b = data[p + 0] << 8;
-
 #if (1)
 			//printf("htobe16(r) = %d, r = %d\n", htobe16(r), r);
-			img[dst_p + 0] = data[p + 2];
-			img[dst_p + 1] = data[p + 1];
-			img[dst_p + 2] = data[p + 0];
+			img[dst_p + 0] = data[p + 2]; //r
+			img[dst_p + 1] = data[p + 1]; //g
+			img[dst_p + 2] = data[p + 0]; //b
 			if(RGB8888){
 				img[dst_p + 3] = hasa ? data[p + 0] : 0xFF;
 			}
