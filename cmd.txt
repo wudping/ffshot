@@ -1,0 +1,2 @@
+yum install xcb-util-image-devel.x86_64
+

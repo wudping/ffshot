@@ -30,6 +30,8 @@
 #define htobe16 htons
 #endif
 
+#define RGB8888 1
+
 static inline void bwrite(const unsigned char* buffer, size_t bytes) {
 	if (!fwrite(buffer, bytes, 1, stdout)) {
 		fprintf(stderr, "write failed.\n");
@@ -100,7 +102,7 @@ int main(int argc, char* argv[]) {
 	uint32_t bpp = ir->depth;
 
 	// allocate buffer.
-	uint16_t* img = malloc(width * height * 8);
+	uint8_t* img = malloc(width * height * 4);
 	if (!img)
 		errx(2, "Failed to allocate buffer.");
 
@@ -120,26 +122,48 @@ int main(int argc, char* argv[]) {
 	default:
 		errx(2, "No support for bit depths other than 24/32 bit: bit depth %i. Fix me?", bpp);
 	}
+	printf("bpp %d\n", bpp);
 
 	unsigned int end = width * height;
 	unsigned short r, g, b;
 	uint32_t i;
+	size_t p;
+	size_t dst_p;
 	for (i=0; i < end; i++) {
 		// write out pixel
-		size_t p = i * 4;
+		p = i * 4;
+		if(RGB8888){
+			dst_p = i * 4;
+		}else{
+			dst_p = i * 3;
+		}
 		// BGRA? thanks Xorg.
 		r = data[p + 2] << 8;
 		g = data[p + 1] << 8;
 		b = data[p + 0] << 8;
 
-		img[p + 0] = htobe16(r);
-		img[p + 1] = htobe16(g);
-		img[p + 2] = htobe16(b);
-		img[p + 3] = hasa ? htobe16(data[p + 0] * 2) : 0xFFFF;
+#if (1)
+		//printf("htobe16(r) = %d, r = %d\n", htobe16(r), r);
+		img[dst_p + 0] = data[p + 2];
+		img[dst_p + 1] = data[p + 1];
+		img[dst_p + 2] = data[p + 0];
+		if(RGB8888){
+			img[dst_p + 3] = hasa ? data[p + 0] : 0xFF;
+		}
+#endif
 	}
+	//bwrite((unsigned char*) img, width * height * 8);
 
-	bwrite((unsigned char*) img, width * height * 8);
-
+    printf("dpwu w,h = %d, %d ======\n", width, height);
+	if(RGB8888){
+		FILE *fp_yuv=fopen("output_8888.rgba","wb+"); 
+		fwrite((unsigned char*) img, 1, width * height * 4, fp_yuv);    //Y	 
+	    fclose(fp_yuv);
+	}else{
+		FILE *fp_yuv=fopen("output_888.rgb","wb+"); 
+		fwrite((unsigned char*) img, 1, width * height * 3, fp_yuv);    //Y	 
+	    fclose(fp_yuv);
+	}
 	free(img);
 	free(ir);
 
