@@ -41,7 +41,7 @@
 #endif
 
 #define RGB8888 0
-#define FRAME_NUM 3000
+#define FRAME_NUM 3
 
 static inline void bwrite(const unsigned char* buffer, size_t bytes) {
 	if (!fwrite(buffer, bytes, 1, stdout)) {
@@ -68,7 +68,7 @@ static xcb_get_image_reply_t* ir;
 typedef struct {
     char *data;
     long size;
-} image_dpwu_t;
+} image_packet_dpwu_t;
 
 typedef struct XCBGrabContext {
     uint8_t *buffer;
@@ -99,6 +99,8 @@ typedef struct XCBGrabContext {
 } XCBGrabContext;
 
 XCBGrabContext c_dt;
+image_packet_dpwu_t image_dt;
+
 
 
 
@@ -228,7 +230,7 @@ static int allocate_shm(XCBGrabContext *c)
     return 0;
 }
 
-static int xcbgrab_frame_shm(XCBGrabContext *c, image_dpwu_t *pkt)
+static int xcbgrab_frame_shm(XCBGrabContext *c, image_packet_dpwu_t *pkt)
 {
     //XCBGrabContext *c = s->priv_data;
     xcb_shm_get_image_cookie_t iq;
@@ -272,9 +274,75 @@ static int xcbgrab_frame_shm(XCBGrabContext *c, image_dpwu_t *pkt)
 #endif /* CONFIG_LIBXCB_SHM */
 
 
+int getImage(XCBGrabContext *c, image_packet_dpwu_t *pkt)
+{
+	// Get image from the X server. Yuck.
+	fprintf(stderr, "%08x: %ux%u to %ux%u\n", win, pos_x, pos_y, width, height);
+	ic = xcb_get_image(con, XCB_IMAGE_FORMAT_Z_PIXMAP, win, pos_x, pos_y, width, height, ~0);
+	ir = xcb_get_image_reply(con, ic, NULL);
+	if (!ir)
+		errx(2, "Failed to get Image");
 
-int main(int argc, char* argv[]) {
-	if (!(argc == 1 || argc == 2)) { // one arg max
+	unsigned char* data = xcb_get_image_data(ir);
+	if (!data){
+		errx(2, "Failed to get Image data");
+	}
+	uint32_t bpp = ir->depth;
+	// Output image header
+	bwrite((unsigned char*)("farbfeld"), 8);
+	*(uint32_t*)buf = htobe32(width);
+	*(uint32_t*)(buf + 4) = htobe32(height);
+	bwrite(buf, 8);
+
+	unsigned int hasa = 1;
+	switch (bpp) {
+		case 24:
+			hasa = 0;
+		case 32:
+			break;
+		default:
+			errx(2, "No support for bit depths other than 24/32 bit: bit depth %i. Fix me?", bpp);
+	}
+	printf("bpp %d\n", bpp);
+
+	unsigned int end = width * height;
+	unsigned short r, g, b;
+	uint32_t i;
+	size_t p = 0;
+	size_t dst_p = 0;
+	for (i=0; i < end; i++) {
+		// write out pixel
+		p = i * 4;
+		if(RGB8888){
+			dst_p = i * 4;
+		}else{
+			dst_p = i * 3;
+		}
+#if (1)
+		//printf("htobe16(r) = %d, r = %d\n", htobe16(r), r);
+		pkt->data[dst_p + 0] = data[p + 2]; //r
+		pkt->data[dst_p + 1] = data[p + 1]; //g
+		pkt->data[dst_p + 2] = data[p + 0]; //b
+		if(RGB8888){
+			pkt->data[dst_p + 3] = hasa ? data[p + 0] : 0xFF;
+		}
+#endif
+	}
+
+	if(RGB8888){
+		pkt->size = end * 4;
+	}else{
+		pkt->size = end * 3;
+	}
+
+	return 0;
+}
+
+
+int main(int argc, char* argv[]) 
+{
+	if (!(argc == 1 || argc == 2)) 
+	{ // one arg max
 		printf("Usage: %s [wid]\n", argv[0]);
 		return 1;
 	}
@@ -285,11 +353,12 @@ int main(int argc, char* argv[]) {
 	int i_dpwu = 0;
 	XCBGrabContext *c = &c_dt;
 	c->has_shm = 1;
+	image_packet_dpwu_t *pimage_dt = &image_dt;
 
 	con = xcb_connect(NULL, NULL);
-	if (xcb_connection_has_error(con))
+	if (xcb_connection_has_error(con)){
 		errx(2, "Unable to connect to the X server");
-
+	}
 
 	scr = xcb_setup_roots_iterator(xcb_get_setup(con)).data;
 	if (!scr){
@@ -307,9 +376,9 @@ int main(int argc, char* argv[]) {
 	// Get window geometry.
 	gc = xcb_get_geometry(con, win);
 	gr = xcb_get_geometry_reply(con, gc, NULL);
-	if (!gr)
+	if (!gr){
 		errx(1, "0x%08x: no such window");
-
+	}
 	pos_x = gr->x;
 	pos_y = gr->y;
 	width = gr->width;
@@ -321,6 +390,8 @@ int main(int argc, char* argv[]) {
 	if (!img){
 		errx(2, "Failed to allocate buffer.");
 	}
+	pimage_dt->data = img;
+	pimage_dt->size = 0;
 #if (1)
 	struct tm *t;
 	time_t tt;
@@ -329,17 +400,21 @@ int main(int argc, char* argv[]) {
 	printf("pthread_self() = %lu, %4d%02d%02d %02d:%02d:%02d xxxxxffff ====\n", pthread_self(), t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
 #endif
 
-
-
-#if (0)	
 #if (CONFIG_LIBXCB_SHM)
+	c->conn = con;
+
 	if (c->has_shm = check_shm(c->conn)){
 		c->segment = xcb_generate_id(c->conn);
 	}
-			
 #endif
-#endif
-
+	
+	if(RGB8888){
+		sprintf(fileName, "output_%03d_%dx%d_8888.rgba", i_dpwu, width, height);
+	}else{
+		sprintf(fileName, "output_%03d_%dx%d_888.rgb", i_dpwu, width, height);
+	}
+	printf("fileName %s\n", fileName);
+	FILE *fp_yuv=fopen(fileName,"wb+");
 
 	while(1){
 		if(i_dpwu++ > FRAME_NUM){
@@ -347,81 +422,18 @@ int main(int argc, char* argv[]) {
 		}
 
 		usleep(100 * 1000);
+		getImage(c, pimage_dt);
 
-		// Get image from the X server. Yuck.
-		fprintf(stderr, "%08x: %ux%u to %ux%u\n", win, pos_x, pos_y, width, height);
-		ic = xcb_get_image(con, XCB_IMAGE_FORMAT_Z_PIXMAP, win, pos_x, pos_y, width, height, ~0);
-		ir = xcb_get_image_reply(con, ic, NULL);
-		if (!ir)
-			errx(2, "Failed to get Image");
-
-		unsigned char* data = xcb_get_image_data(ir);
-		if (!data){
-			errx(2, "Failed to get Image data");
-		}
-		uint32_t bpp = ir->depth;
-		// Output image header
-		bwrite((unsigned char*)("farbfeld"), 8);
-		*(uint32_t*)buf = htobe32(width);
-		*(uint32_t*)(buf + 4) = htobe32(height);
-		bwrite(buf, 8);
-
-		unsigned int hasa = 1;
-		switch (bpp) {
-			case 24:
-				hasa = 0;
-			case 32:
-				break;
-			default:
-				errx(2, "No support for bit depths other than 24/32 bit: bit depth %i. Fix me?", bpp);
-		}
-		printf("bpp %d\n", bpp);
-
-		unsigned int end = width * height;
-		unsigned short r, g, b;
-		uint32_t i;
-		size_t p;
-		size_t dst_p;
-		for (i=0; i < end; i++) {
-			// write out pixel
-			p = i * 4;
-			if(RGB8888){
-				dst_p = i * 4;
-			}else{
-				dst_p = i * 3;
-			}
-#if (1)
-			//printf("htobe16(r) = %d, r = %d\n", htobe16(r), r);
-			img[dst_p + 0] = data[p + 2]; //r
-			img[dst_p + 1] = data[p + 1]; //g
-			img[dst_p + 2] = data[p + 0]; //b
-			if(RGB8888){
-				img[dst_p + 3] = hasa ? data[p + 0] : 0xFF;
-			}
-#endif
-		}
-		//bwrite((unsigned char*) img, width * height * 8);
 	    printf("dpwu w,h = %d, %d, i_dpwu = %d ======\n", width, height, i_dpwu);
-		#if (0)
-		if(RGB8888){
-			sprintf(fileName, "output_%03d_%dx%d_8888.rgba", i_dpwu, width, height);
-			FILE *fp_yuv=fopen(fileName,"wb+"); 
-			fwrite((unsigned char*) img, 1, width * height * 4, fp_yuv);    //Y	 
-		    fclose(fp_yuv);
-		}else{
-			sprintf(fileName, "output_%03d_%dx%d_888.rgb", i_dpwu, width, height);
-			FILE *fp_yuv=fopen(fileName,"wb+");
-			fwrite((unsigned char*) img, 1, width * height * 3, fp_yuv);    //Y	 
-		    fclose(fp_yuv);
-		}
-		
-		printf("fileName %s\n", fileName);
+		#if (1)
+		fwrite((unsigned char*) pimage_dt->data, 1, pimage_dt->size, fp_yuv);    //Y	 
 		#endif
 	}
+	fclose(fp_yuv);
 #if (1)
-		time(&tt);
-		t = localtime(&tt);
-		printf("after pthread_self() = %lu, %4d%02d%02d %02d:%02d:%02d xxxxxffff ====\n", pthread_self(), t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
+	time(&tt);
+	t = localtime(&tt);
+	printf("after pthread_self() = %lu, %4d%02d%02d %02d:%02d:%02d xxxxxffff ====\n", pthread_self(), t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
 #endif
 	free(img);
 	free(ir);
